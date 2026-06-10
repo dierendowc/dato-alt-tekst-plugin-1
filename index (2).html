@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="utf-8" />
+<title>Alt-tekst AI — DatoCMS plugin</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    font-family: colfax-web, Roboto, -apple-system, sans-serif;
+    font-size: 14px;
+    color: #333;
+  }
+  label { display: block; font-weight: 600; margin: 14px 0 4px; }
+  input[type="text"], input[type="password"] {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid #d0d0d0;
+    border-radius: 4px;
+    font-size: 14px;
+    font-family: inherit;
+  }
+  .hint { color: #777; font-size: 12px; margin-top: 4px; }
+  .row { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+  button {
+    padding: 9px 16px;
+    border: none;
+    border-radius: 4px;
+    background: #ff7751;
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { background: #f4602f; }
+  button:disabled { background: #ccc; cursor: not-allowed; }
+  button.secondary { background: #f0f0f0; color: #333; }
+  .status { margin-top: 10px; font-size: 13px; }
+  .status.error { color: #c0392b; }
+  .status.ok { color: #1e8449; }
+  .current-alt {
+    background: #f7f7f7; border-radius: 4px; padding: 10px;
+    margin-top: 8px; font-style: italic; color: #555;
+  }
+  .online-check {
+    border: 1px solid #b7e1c1; background: #f0faf2; color: #1e8449;
+    border-radius: 6px; padding: 14px; line-height: 1.5;
+  }
+  /* Bulk-pagina */
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 14px 0; }
+  .grid {
+    display: grid; gap: 12px; margin-top: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  }
+  .card {
+    display: block; border: 2px solid #e2e2e2; border-radius: 8px;
+    padding: 8px; cursor: pointer; font-weight: 400; margin: 0;
+    background: #fff;
+  }
+  .card:has(input:checked) { border-color: #ff7751; background: #fff7f4; }
+  .card img {
+    width: 100%; height: 110px; object-fit: cover;
+    border-radius: 4px; background: #f0f0f0; display: block;
+  }
+  .card .fname {
+    font-size: 11px; color: #777; margin-top: 6px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .badge { font-size: 12px; margin-top: 4px; }
+  .badge.has { color: #1e8449; }
+  .badge.missing { color: #b46a00; }
+  .cardstatus { font-size: 11px; margin-top: 4px; min-height: 14px; }
+  .cardstatus.ok { color: #1e8449; }
+  .cardstatus.err { color: #c0392b; }
+</style>
+</head>
+<body>
+<div id="root">Laden…</div>
+
+<script type="module">
+const root = document.getElementById('root');
+const CLAUDE_MODEL = 'claude-haiku-4-5-20251001';
+const LANGUAGE_NAMES = { nl: 'Nederlands', en: 'Engels', de: 'Duits', fr: 'Frans', es: 'Spaans', it: 'Italiaans' };
+const SUPPORTED_FORMATS = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
+
+let rendered = false;
+
+setTimeout(() => {
+  if (!rendered) {
+    root.innerHTML = `<div class="online-check">
+      ✅ <strong>De plugin staat online en werkt!</strong><br>
+      Deze pagina doet alleen iets bínnen DatoCMS. Kopieer deze URL en vul hem
+      in DatoCMS in als Entry point URL:<br>
+      <strong>${location.origin}${location.pathname}</strong>
+    </div>`;
+  }
+}, 2500);
+
+const escapeHtml = (s) =>
+  String(s ?? '').replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const isImage = (attrs) =>
+  (attrs.mime_type ?? '').startsWith('image/')
+  && SUPPORTED_FORMATS.includes((attrs.format ?? '').toLowerCase());
+
+function datoHeaders(ctx) {
+  return {
+    Authorization: `Bearer ${ctx.currentUserAccessToken}`,
+    Accept: 'application/json',
+    'Content-Type': 'application/vnd.api+json',
+    'X-Api-Version': '3',
+    'X-Environment': ctx.environment,
+  };
+}
+
+// Bepaalt automatisch de juiste taalcode: pakt de instelling als die bestaat
+// in het project, en anders de eerste taal van het project (bijv. "nl-NL")
+function resolveLocale(ctx) {
+  const projectLocales = ctx.site?.attributes?.locales ?? [];
+  const wanted = (ctx.plugin.attributes.parameters ?? {}).locale;
+  if (wanted && projectLocales.includes(wanted)) return wanted;
+  // Instelling bestaat niet exact? Zoek een taal die ermee begint (nl → nl-NL)
+  if (wanted) {
+    const match = projectLocales.find((l) => l.toLowerCase().startsWith(wanted.toLowerCase()));
+    if (match) return match;
+  }
+  return projectLocales[0] ?? wanted ?? 'en';
+}
+
+async function generateAltText(imageUrl, apiKey, locale) {
+  const language = LANGUAGE_NAMES[locale.split('-')[0].toLowerCase()] ?? locale;
+  const sep = imageUrl.includes('?') ? '&' : '?';
+  const resizedUrl = `${imageUrl}${sep}w=800&fm=jpg&q=70`;
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: 200,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'url', url: resizedUrl } },
+          { type: 'text', text:
+            `Schrijf een beknopte alt-tekst voor deze afbeelding in het ${language}. ` +
+            'Maximaal 125 tekens. Beschrijf feitelijk en concreet wat er te zien is. ' +
+            'Verwerk waar relevant en natuurlijk de keywords "ROC Mondriaan" en "mbo opleiding" in de alt-tekst. ' +
+            'Begin NIET met "Afbeelding van" of "Foto van". ' +
+            'Antwoord uitsluitend met de alt-tekst zelf, zonder aanhalingstekens of uitleg.' },
+        ],
+      }],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Claude API fout (${response.status})`);
+  }
+  const data = await response.json();
+  const text = (data.content ?? [])
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text)
+    .join(' ')
+    .trim();
+  if (!text) throw new Error('Claude gaf geen tekst terug');
+  return text.length > 150 ? text.slice(0, 150).replace(/\s+\S*$/, '') : text;
+}
+
+async function saveAltText(ctx, uploadId, attrs, altText, locale) {
+  const existingMeta = attrs.default_field_metadata ?? {};
+  const localeMeta = existingMeta[locale] ?? {};
+
+  const response = await fetch(`https://site-api.datocms.com/uploads/${uploadId}`, {
+    method: 'PUT',
+    headers: datoHeaders(ctx),
+    body: JSON.stringify({
+      data: {
+        id: uploadId,
+        type: 'upload',
+        attributes: {
+          default_field_metadata: {
+            ...existingMeta,
+            [locale]: {
+              ...localeMeta,
+              alt: altText,
+              title: localeMeta.title ?? null,
+              custom_data: localeMeta.custom_data ?? {},
+            },
+          },
+        },
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Opslaan mislukt (${response.status})`);
+  }
+}
+
+// Zoekt alle records die uploadId gebruiken en overschrijft de alt als die
+// leeg was of gelijk was aan oldAlt (zodat handmatige overrides intact blijven)
+async function propagateAltToRecords(ctx, uploadId, oldAlt, newAlt, locale) {
+  // 1. Zoek alle item-types (modellen) op
+  const modelsRes = await fetch('https://site-api.datocms.com/item-types', {
+    headers: datoHeaders(ctx),
+  });
+  if (!modelsRes.ok) return { updated: 0, skipped: 0 };
+  const modelsData = await modelsRes.json();
+  const models = modelsData.data ?? [];
+
+  // 2. Haal per model de velden op om file/gallery-velden te vinden
+  const fileFields = []; // { itemTypeId, fieldApiKey, fieldType }
+  for (const model of models) {
+    const fieldsRes = await fetch(
+      `https://site-api.datocms.com/fields?filter[item_type]=${model.id}`,
+      { headers: datoHeaders(ctx) },
+    );
+    if (!fieldsRes.ok) continue;
+    const fieldsData = await fieldsRes.json();
+    for (const field of (fieldsData.data ?? [])) {
+      if (['file', 'gallery'].includes(field.attributes.field_type)) {
+        fileFields.push({
+          itemTypeId: model.id,
+          apiKey: field.attributes.api_key,
+          fieldType: field.attributes.field_type,
+        });
+      }
+    }
+  }
+
+  if (!fileFields.isEmpty) {
+    // niets te doen
+  }
+
+  let updated = 0;
+  let skipped = 0;
+
+  // 3. Per model met file-velden: haal records op en check
+  const modelIds = [...new Set(fileFields.map((f) => f.itemTypeId))];
+  for (const modelId of modelIds) {
+    const fields = fileFields.filter((f) => f.itemTypeId === modelId);
+
+    let page = 0;
+    while (true) {
+      const itemsRes = await fetch(
+        `https://site-api.datocms.com/items?filter[type]=${modelId}&page[limit]=100&page[offset]=${page * 100}`,
+        { headers: datoHeaders(ctx) },
+      );
+      if (!itemsRes.ok) break;
+      const itemsData = await itemsRes.json();
+      const items = itemsData.data ?? [];
+      if (!items.length) break;
+
+      for (const item of items) {
+        const attrs = item.attributes ?? {};
+        let needsUpdate = false;
+        const patch = {};
+
+        for (const field of fields) {
+          const val = attrs[field.apiKey];
+          if (!val) continue;
+
+          if (field.fieldType === 'file') {
+            // Enkelvoudig bestand
+            const fileVal = val[locale] ?? val; // localized of niet
+            if (fileVal?.upload_id === uploadId) {
+              const currentAlt = fileVal.alt ?? '';
+              if (currentAlt === '' || currentAlt === oldAlt) {
+                patch[field.apiKey] = field.apiKey in attrs && attrs[field.apiKey][locale] !== undefined
+                  ? { ...attrs[field.apiKey], [locale]: { ...fileVal, alt: newAlt } }
+                  : { ...fileVal, alt: newAlt };
+                needsUpdate = true;
+              } else {
+                skipped++;
+              }
+            }
+          } else if (field.fieldType === 'gallery') {
+            // Galerij: array van bestanden
+            const gallery = val[locale] ?? val;
+            if (!Array.isArray(gallery)) continue;
+            let changed = false;
+            const newGallery = gallery.map((fileVal) => {
+              if (fileVal?.upload_id === uploadId) {
+                const currentAlt = fileVal.alt ?? '';
+                if (currentAlt === '' || currentAlt === oldAlt) {
+                  changed = true;
+                  return { ...fileVal, alt: newAlt };
+                } else {
+                  skipped++;
+                }
+              }
+              return fileVal;
+            });
+            if (changed) {
+              patch[field.apiKey] = field.apiKey in attrs && attrs[field.apiKey][locale] !== undefined
+                ? { ...attrs[field.apiKey], [locale]: newGallery }
+                : newGallery;
+              needsUpdate = true;
+            }
+          }
+        }
+
+        if (needsUpdate) {
+          const updateRes = await fetch(`https://site-api.datocms.com/items/${item.id}`, {
+            method: 'PUT',
+            headers: datoHeaders(ctx),
+            body: JSON.stringify({
+              data: { id: item.id, type: 'item', attributes: patch },
+            }),
+          });
+          if (updateRes.ok) updated++;
+        }
+      }
+
+      if (items.length < 100) break;
+      page++;
+    }
+  }
+
+  return { updated, skipped };
+}
+
+async function fetchAllUploads(ctx) {
+  const all = [];
+  let offset = 0;
+  while (offset <= 5000) {
+    const r = await fetch(
+      `https://site-api.datocms.com/uploads?page[limit]=100&page[offset]=${offset}`,
+      { headers: datoHeaders(ctx) },
+    );
+    if (!r.ok) throw new Error(`Ophalen van uploads mislukt (${r.status})`);
+    const data = await r.json();
+    all.push(...(data.data ?? []));
+    if ((data.data ?? []).length < 100) break;
+    offset += 100;
+  }
+  return all;
+}
+
+function needsSetup(ctx) {
+  const params = ctx.plugin.attributes.parameters ?? {};
+  if (!params.apiKey) {
+    root.innerHTML = `<div class="status error">Stel eerst je Anthropic API key in via
+      Settings → Plugins → Alt-tekst AI.</div>`;
+    return true;
+  }
+  if (!ctx.currentUserAccessToken) {
+    root.innerHTML = `<div class="status error">Deze plugin heeft toegang tot je
+      gebruikerstoken nodig. Voeg in Settings → Plugins → Alt-tekst AI bij
+      "Permissions" de toegang tot het access token toe.</div>`;
+    return true;
+  }
+  return false;
+}
+
+try {
+  const { connect } = await import('https://esm.sh/datocms-plugin-sdk');
+
+  connect({
+
+    // ===== Instellingenscherm =====
+    renderConfigScreen(ctx) {
+      rendered = true;
+      ctx.startAutoResizer();
+      const params = ctx.plugin.attributes.parameters ?? {};
+
+      root.innerHTML = `
+        <h3 style="margin-top:0">Alt-tekst AI — instellingen</h3>
+
+        <label for="apiKey">Anthropic API key</label>
+        <input type="password" id="apiKey" value="${escapeHtml(params.apiKey ?? '')}"
+               placeholder="sk-ant-..." />
+        <div class="hint">Aanmaken op console.anthropic.com → Settings → API keys</div>
+
+        <label for="locale">Taal (locale-code)</label>
+        <input type="text" id="locale" value="${escapeHtml(params.locale ?? resolveLocale(ctx))}" />
+        <div class="hint">Talen in dit project: ${escapeHtml((ctx.site?.attributes?.locales ?? []).join(', ') || 'onbekend')}
+          — de plugin kiest automatisch een geldige taal als deze instelling niet klopt</div>
+
+        <div class="row">
+          <input type="checkbox" id="autoGenerate" ${params.autoGenerate ? 'checked' : ''} />
+          <label for="autoGenerate" style="margin:0">
+            Automatisch genereren zodra je een afbeelding zonder alt-tekst opent
+          </label>
+        </div>
+
+        <button id="save" style="margin-top:14px">Instellingen opslaan</button>
+        <div class="status" id="status"></div>
+      `;
+
+      document.getElementById('save').addEventListener('click', async () => {
+        const apiKey = document.getElementById('apiKey').value.trim();
+        if (!apiKey.startsWith('sk-ant-')) {
+          const st = document.getElementById('status');
+          st.textContent = 'Dat lijkt geen geldige Anthropic key (begint met sk-ant-)';
+          st.className = 'status error';
+          return;
+        }
+        await ctx.updatePluginParameters({
+          apiKey,
+          locale: document.getElementById('locale').value.trim() || 'nl',
+          autoGenerate: document.getElementById('autoGenerate').checked,
+        });
+        ctx.notice('Instellingen opgeslagen ✅');
+      });
+    },
+
+    // ===== Paneel bij één afbeelding in de Media Area =====
+    uploadSidebarPanels() {
+      return [{ id: 'altTextAi', label: 'Alt-tekst (AI)', startOpen: true }];
+    },
+
+    renderUploadSidebarPanel(panelId, ctx) {
+      rendered = true;
+      ctx.startAutoResizer();
+      if (needsSetup(ctx)) return;
+
+      const params = ctx.plugin.attributes.parameters ?? {};
+      const upload = ctx.upload;
+      const locale = resolveLocale(ctx);
+
+      if (!isImage(upload.attributes)) {
+        root.innerHTML = `<div class="status">Dit bestandstype wordt niet ondersteund
+          (alleen jpg, png, gif en webp).</div>`;
+        return;
+      }
+
+      const currentAlt = upload.attributes.default_field_metadata?.[locale]?.alt ?? '';
+
+      root.innerHTML = `
+        ${currentAlt
+          ? `<div class="hint">Huidige alt-tekst (${escapeHtml(locale)}):</div>
+             <div class="current-alt" id="currentAlt">${escapeHtml(currentAlt)}</div>`
+          : `<div class="hint">Nog geen alt-tekst voor locale "${escapeHtml(locale)}".</div>`}
+        <button id="generate" style="margin-top:14px">✨ ${currentAlt ? 'Opnieuw genereren' : 'Genereer alt-tekst'}</button>
+        <div class="status" id="status"></div>
+      `;
+
+      const statusEl = document.getElementById('status');
+      const button = document.getElementById('generate');
+
+      const run = async () => {
+        button.disabled = true;
+        statusEl.className = 'status';
+        statusEl.textContent = 'Bezig met genereren…';
+        try {
+          const oldAlt = upload.attributes.default_field_metadata?.[locale]?.alt ?? '';
+          const altText = await generateAltText(upload.attributes.url, params.apiKey, locale);
+          statusEl.textContent = 'Opslaan in Media Library…';
+          await saveAltText(ctx, upload.id, upload.attributes, altText, locale);
+
+          statusEl.textContent = 'Alt-tekst doorvoeren naar pagina's…';
+          const { updated, skipped } = await propagateAltToRecords(ctx, upload.id, oldAlt, altText, locale);
+
+          statusEl.className = 'status ok';
+          statusEl.innerHTML = `
+            ✅ Opgeslagen in Media Library en doorgevoerd naar ${updated} pagina${updated !== 1 ? "'s" : ""}!
+            ${skipped ? `<div class="hint">${skipped} veld${skipped !== 1 ? 'en' : ''} overgeslagen (hadden een eigen alt-tekst).</div>` : ''}
+            <input type="text" id="resultText" readonly
+                   value="${escapeHtml(altText)}" style="margin-top:8px" />
+            <button id="copyBtn" style="margin-top:8px;padding:6px 12px;font-size:13px">
+              📋 Kopieer tekst
+            </button>
+          `;
+          const resultInput = document.getElementById('resultText');
+          resultInput.addEventListener('click', () => resultInput.select());
+          document.getElementById('copyBtn').addEventListener('click', async () => {
+            try {
+              await navigator.clipboard.writeText(altText);
+            } catch {
+              resultInput.select();
+              document.execCommand('copy');
+            }
+            ctx.notice('Gekopieerd naar klembord 📋');
+          });
+          const currentAltEl = document.getElementById('currentAlt');
+          if (currentAltEl) currentAltEl.textContent = altText;
+          ctx.notice(`Alt-tekst opgeslagen en doorgevoerd naar ${updated} pagina's ✅`);
+        } catch (error) {
+          statusEl.className = 'status error';
+          statusEl.textContent = error.message;
+        } finally {
+          button.disabled = false;
+        }
+      };
+
+      button.addEventListener('click', run);
+      if (params.autoGenerate && !currentAlt) run();
+    },
+
+    // ===== Field addon: knopje bij asset-veld binnen een record =====
+    manualFieldExtensions() {
+      return [{
+        id: 'altTextAiField',
+        name: 'Alt-tekst AI',
+        type: 'addon',
+        fieldTypes: ['file'],
+      }];
+    },
+
+    renderManualFieldExtension(extensionId, ctx) {
+      rendered = true;
+      ctx.startAutoResizer();
+
+      const params = ctx.plugin.attributes.parameters ?? {};
+      if (!params.apiKey) {
+        root.innerHTML = `<div class="status error" style="font-size:12px">
+          Stel eerst je Anthropic API key in via Settings → Plugins.</div>`;
+        return;
+      }
+
+      const locale = resolveLocale(ctx);
+
+      const render = () => {
+        const value = ctx.formValues[ctx.fieldPath];
+        if (!value || !value.upload_id) {
+          root.innerHTML = `<div class="hint" style="font-size:12px">
+            Selecteer eerst een afbeelding.</div>`;
+          return;
+        }
+
+        const uploadId = value.upload_id;
+        const currentAlt = value.alt ?? '';
+
+        root.innerHTML = `
+          ${currentAlt
+            ? `<div class="hint" style="font-size:11px;margin-bottom:6px">
+                Huidige alt-tekst: <em>${escapeHtml(currentAlt)}</em></div>`
+            : `<div class="hint" style="font-size:11px;margin-bottom:6px">
+                Nog geen alt-tekst.</div>`}
+          <button id="genField" style="padding:6px 12px;font-size:13px">
+            ✨ ${currentAlt ? 'Opnieuw genereren' : 'Genereer alt-tekst'}
+          </button>
+          <div class="status" id="statusField" style="font-size:12px;margin-top:6px"></div>
+        `;
+
+        const statusEl = document.getElementById('statusField');
+        const btn = document.getElementById('genField');
+
+        const run = async () => {
+          btn.disabled = true;
+          statusEl.className = 'status';
+          statusEl.textContent = 'Bezig…';
+
+          try {
+            const r = await fetch(
+              `https://site-api.datocms.com/uploads/${uploadId}`,
+              { headers: datoHeaders(ctx) },
+            );
+            if (!r.ok) throw new Error(`Upload ophalen mislukt (${r.status})`);
+            const uploadData = await r.json();
+            const attrs = uploadData.data?.attributes ?? {};
+
+            if (!isImage(attrs)) {
+              statusEl.textContent = 'Bestandstype niet ondersteund.';
+              btn.disabled = false;
+              return;
+            }
+
+            const altText = await generateAltText(attrs.url, params.apiKey, locale);
+
+            await ctx.setFieldValue(ctx.fieldPath, {
+              ...value,
+              alt: altText,
+            });
+
+            statusEl.className = 'status ok';
+            statusEl.textContent = `✅ ${altText}`;
+            ctx.notice('Alt-tekst ingevuld ✅');
+          } catch (e) {
+            statusEl.className = 'status error';
+            statusEl.textContent = e.message;
+          } finally {
+            btn.disabled = false;
+          }
+        };
+
+        btn.addEventListener('click', run);
+        if (params.autoGenerate && !currentAlt) run();
+      };
+
+      render();
+      ctx.addChangeListener(ctx.fieldPath, render);
+    },
+
+  });
+} catch (error) {
+  rendered = true;
+  root.innerHTML = `<div class="status error">De plugin-SDK kon niet geladen worden:
+    ${escapeHtml(error.message)}. Controleer je internetverbinding en herlaad de pagina.</div>`;
+}
+</script>
+</body>
+</html>
